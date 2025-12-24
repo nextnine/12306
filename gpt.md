@@ -378,4 +378,4 @@ sequenceDiagram
 
   MQ->>T: consume ticketing
   T->>DB: order->SUCCESS or FAILED
-
+end
