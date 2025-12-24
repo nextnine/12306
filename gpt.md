@@ -360,3 +360,22 @@ sequenceDiagram
   else fail
     W->>DB: order->FAILED
   end
+sequenceDiagram
+  participant Pay as PaymentGW
+  participant P as PaymentSvc
+  participant DB as DB
+  participant MQ as MQ
+  participant T as TicketingSvc
+
+  Pay->>P: callback(txn_id, order_id)
+  P->>DB: idempotency check
+  alt first time
+    P->>DB: order->PAID
+    P->>MQ: enqueue ticketing
+  else duplicate
+    P-->>Pay: OK
+  end
+
+  MQ->>T: consume ticketing
+  T->>DB: order->SUCCESS or FAILED
+
