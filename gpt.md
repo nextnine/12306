@@ -360,22 +360,46 @@ sequenceDiagram
   else fail
     W->>DB: order->FAILED
   end
-```mermaid
+
 sequenceDiagram
+  participant C as Client
+  participant G as Gateway
+  participant O as OrderSvc
+  participant MQ as MQ
+  participant W as Worker
+  participant R as Redis
+  participant DB as DB
   participant Pay as PaymentGW
   participant P as PaymentSvc
-  participant DB as DB
-  participant MQ as MQ
   participant T as TicketingSvc
 
-  Pay->>P: callback(txn_id, order_id)
-  P->>DB: idempotency check
-  alt first time
-    P->>DB: order->PAID
-    P->>MQ: enqueue ticketing
-  else duplicate
-    P-->>Pay: OK
+  rect rgba(230,230,230,0.25)
+    note over C,DB: Phase 1 - Create & Queue
+    C->>G: POST /orders (Idempotency-Key)
+    G->>O: create INIT + queue_token
+    O->>MQ: enqueue(order_id)
+    O-->>C: queue_token
+
+    MQ->>W: consume(order_id)
+    W->>R: Lua multi-seg check and decr
+    alt success
+      W->>DB: write lock; set order=LOCKED
+    else fail
+      W->>DB: set order=FAILED
+    end
   end
 
-  MQ->>T: consume ticketing
-  T->>DB: order->SUCCESS or FAILED
+  rect rgba(230,230,255,0.25)
+    note over Pay,DB: Phase 2 - Payment Callback & Ticketing
+    Pay->>P: callback(txn_id, order_id)
+    P->>DB: idempotency check
+    alt first time
+      P->>DB: set order=PAID
+      P->>MQ: enqueue ticketing
+    else duplicate
+      P-->>Pay: OK
+    end
+
+    MQ->>T: consume ticketing
+    T->>DB: set order=SUCCESS or FAILED
+  end
