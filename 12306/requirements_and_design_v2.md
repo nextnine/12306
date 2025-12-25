@@ -7,6 +7,17 @@
 
 ---
 
+## 章节摘要
+- 前言/引言：目标读者、系统目标（查询/写峰值、可用性、一致性）与外部依赖。
+- 术语与缩写：库存、幂等、排队等核心术语及缩写速查。
+- 用户需求：查询/下单/退改/候补/通知等功能与非功能指标。
+- 关键策略：缓存、库存、防超卖、幂等、对账、锁座、排队、降级、频控、安全、容量、告警等实施要点与公式。
+- 体系结构：分层与组件、部署拓扑（mermaid）。
+- 需求规格：领域用例与接口约束/示例。
+- 模型：对象模型、ER 示意、时序与状态机。
+- 演化与 ADR：阶段性演进与关键决策摘要。
+- 附录：容量、最小部署、压测说明。
+
 ## 前言
 
 ### 目标读者与范围
@@ -101,6 +112,7 @@
 - **指标/告警示例**：库存超卖检测（实际-理论 ≥1 即告警）、DLQ 长度>100 或增长率异常、支付回调重复率>0.5%、排队等待时间 P95>60s、缓存命中率<95% 告警。  
 - **灰度与频控配置示例**：灰度按用户/设备标签或地市分流，可配置灰度比例 1%~20%、灰度开关、回滚窗口；频控提供默认阈值（账号 3 QPS、设备 3 QPS、IP 10 QPS、日购票次数 5 次/账号、同乘客同车次 30 分钟冷却），可按席别/车次维度下发差异化阈值。  
 - **告警阈值表（示例，可配置）**：库存对账差值≥1 立即告警；支付回调重复率>0.5%（5 分钟窗口）；DLQ 长度>100 或 5 分钟内增长>50%；排队等待 P95>60s；缓存命中率<95%；Redis/DB/消息耗时 P95 超过目标×1.5 触发黄色告警。  
+- **改签与多票规则**：改签需满足时间/车次限制（如开车前≥30分钟），按铁路/渠道费率计算差额和手续费；改签成功后旧票作废并回补库存，失败则保持原票；同一乘客同一开车时段（如 2 小时窗口）限持一张有效票，冲突时需退/改后再购，规则在下单校验与排队出队时同时检查。  
 
 ---
 
@@ -265,12 +277,105 @@ flowchart TB
 - `POST /ticket/refund`、`POST /ticket/change`、`POST /ticket/standby`：退票/改签/候补。  
 - `GET /config/toggles`：获取灰度/频控/风控策略。
 
+### 接口示例（请求/响应）
+- `POST /order/queue`  
+  请求示例：
+  ```json
+  {
+    "train_no": "G1234",
+    "date": "2025-02-01",
+    "segment": ["BJP", "SHH"],
+    "seat_class": "2ND",
+    "passengers": [{"id": "P1", "name": "Zhang San", "id_type": "ID", "id_no": "xxxx"}],
+    "idempotent_key": "u123-20250201-G1234-2ND-abc",
+    "channel": "app"
+  }
+  ```
+  响应示例：
+  ```json
+  {
+    "queue_token": "qt-8f3d",
+    "status": "IN_QUEUE",
+    "estimate_sec": 60
+  }
+  ```
+- `GET /order/queue/{token}`  
+  响应示例：
+  ```json
+  {
+    "status": "READY_TO_PAY",
+    "order_token": "ord-123",
+    "pay_url": "https://pay.example.com/xxx"
+  }
+  ```
+- `POST /payment/callback`（渠道→平台）  
+  请求示例：
+  ```json
+  {
+    "payment_id": "pay-123",
+    "order_id": "ord-123",
+    "status": "SUCCESS",
+    "amount": 56000,
+    "notify_version": 3,
+    "sign": "xxx"
+  }
+  ```
+  响应示例：
+  ```json
+  { "code": 0, "msg": "ok" }
+  ```
+
 ---
 
 ## 系统模型
 
 ### 核心对象模型
 - **Train**（车次）、**Station**（站点）、**SegmentInventory**（区间库存）、**SeatLock**（席位占用）、**Order**、**OrderItem**、**Payment**、**Ticket**、**Refund/Change**、**StandbyRequest**、**RiskProfile**、**ConfigToggle**。
+
+### 数据模型示意（简化 ER）
+```mermaid
+erDiagram
+  TRAIN ||--o{ SEGMENTINVENTORY : has
+  TRAIN ||--o{ SEATLOCK : alloc
+  ORDER ||--|{ ORDERITEM : contains
+  ORDER ||--|| PAYMENT : maps
+  ORDER ||--o{ TICKET : issues
+  ORDER ||--o{ REFUNDCHANGE : aftersales
+  ORDER ||--o{ STANDBYREQUEST : fallback
+  USER ||--o{ ORDER : creates
+  USER ||--o{ PASSENGER : manages
+  SEGMENTINVENTORY {
+    string train_no
+    date run_date
+    string segment_id
+    string seat_class
+    int remain
+    int version
+  }
+  ORDER {
+    string id
+    string user_id
+    string status
+    string queue_token
+    string idempotent_key
+    datetime expire_at
+    int amount
+  }
+  PAYMENT {
+    string id
+    string order_id
+    string channel
+    string status
+    int amount
+    int notify_version
+  }
+  TICKET {
+    string id
+    string order_id
+    string ticket_no
+    string passenger_id
+  }
+```
 
 ### 关键时序（下单→支付→出票）
 ```mermaid
@@ -333,6 +438,13 @@ flowchart LR
 - **阶段 2：削峰与弹性** —— 引入排队/令牌桶、写入削峰；K8s 水平扩容；冷/热缓存与热点隔离；异步落库与批量刷盘。  
 - **阶段 3：一致性与成本优化** —— 库存账本化，对账与巡检自动纠偏；冷热数据分层（历史订单归档到 OSS/冷库）；索引/分区/分片再均衡。  
 - **阶段 4：多活与全链路治理** —— 同城/异地多活，跨机房数据同步；故障演练、自动化压测、全链路灰度与观测；AI 辅助风控与容量预测。
+
+### 关键决策记录（ADR 摘要）
+- 排队削峰与写入速率：采用队列+速率 `min(2%*remain, 2000)` 控制写入节奏，拒绝超长队列转候补。
+- 库存一致性：区间库存 Redis 预扣 + 账本化落库 + 定时对账，放弃跨库分布式事务。
+- Redis 选型：使用 Redis Cluster（slot 分片+自动故障转移），单分片目标 <5 万 QPS，热点拆 key。
+- 改签与多票约束：同乘客同一时间窗限持一票，改签成功后回补旧票库存。
+- 可观测与告警：对账差值、DLQ、支付回调重复率、排队 P95、缓存命中率设定阈值告警。
 
 ---
 
