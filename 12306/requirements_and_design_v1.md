@@ -102,6 +102,17 @@
 - **扩展性**：按车次/日期/站点分库分表；服务无状态可横向扩容；模块化演进。  
 - **运维性**：全链路监控、自动扩缩容、演练与压测能力。
 
+#### 幂等与一致性设计（跨服务）
+- **幂等 token 传递**：入口生成 `idempotent_key`（用户+业务维度，含过期策略）并在网关透传，服务间调用与 MQ 消费均携带，作为幂等表主键或 Redis SETNX Key。  
+- **请求去重**：  
+  - API/Order：`idempotent_key` + `order_token` 防重复下单；写幂等表记录指纹+状态。  
+  - Payment 回调：`payment_id` + 回调序号做去重，写幂等表；回调验签、重放保护。  
+  - MQ 消费：消息 ID 去重（消费表或 Redis Bloom/SET），幂等消费后再 ACK。  
+- **分布式事务/最终一致**：核心链路采用“预扣（Redis 原子）→异步落库账本→对账补偿”，不依赖跨库分布式事务。  
+- **幂等状态推进**：状态机只能单向推进（如 WAIT_PAY→PAID→TICKETING→SUCCESS/FAIL），重复消息只做幂等更新，确保可重复执行。  
+- **时序错乱保护**：所有事件携带版本/时间戳，低版本更新被拒绝；对账任务定期矫正库存/资金。  
+- **补偿流程**：出票失败→回滚库存+退款；回调超时/失败→重试+人工告警；账实不符→巡检任务自动纠偏。
+
 ### 关键接口（示例）
 - `POST /order/queue`：提交下单请求，返回 queue_token。  
 - `GET /order/queue/{token}`：查询排队进度/结果。  
@@ -243,6 +254,65 @@ stateDiagram-v2
     REFUNDED --> [*]
 ```
 
+#### 数据模型/ER（核心表约束摘要）
+```mermaid
+%%{init: {'theme':'neutral','flowchart':{'nodeSpacing':28,'rankSpacing':40}}}%%
+erDiagram
+    TRAIN ||--o{ SEGMENT : has
+    TRAIN ||--o{ INVENTORY : owns
+    STATION ||--o{ SEGMENT : connects
+    INVENTORY ||--o{ SEAT_LOCK : locks
+    ORDER ||--|{ ORDER_ITEM : contains
+    ORDER ||--o{ PAYMENT : pay_for
+    ORDER ||--o{ TICKET : issues
+    ORDER ||--o{ REFUND : refunds
+    ORDER ||--o{ CHANGE : changes
+    ORDER ||--o{ STANDBY : waits
+    USER ||--o{ ORDER : places
+    USER ||--o{ STANDBY : requests
+    PAYMENT ||--o{ PAYMENT_CALLBACK : notifies
+
+    ORDER {
+      string order_id PK
+      string user_id
+      string status
+      string idempotent_key UNIQUE
+      datetime created_at
+      datetime updated_at
+    }
+    INVENTORY {
+      string inv_id PK
+      string train_id
+      date travel_date
+      string segment_id
+      int remain
+      int locked
+      int version
+    }
+    PAYMENT {
+      string pay_id PK
+      string order_id FK
+      string channel
+      string status
+      string currency
+      decimal amount
+    }
+    PAYMENT_CALLBACK {
+      string cb_id PK
+      string pay_id FK
+      string seq_no
+      string status
+      datetime received_at
+    }
+    SEAT_LOCK {
+      string lock_id PK
+      string inv_id FK
+      string seat_no
+      string status
+      datetime expire_at
+    }
+```
+
 ---
 
 ## 系统演化
@@ -251,7 +321,21 @@ stateDiagram-v2
   - 流量增长：按车次/日期分片，库存 Key 拆分，排队分区。  
   - 业务扩展：支持多渠道（小程序/APP/网页）、多支付方式、国际化。  
   - 技术演进：引入区间库存专用存储、席位图压缩编码、基于事件的库存账本。  
-  - 可靠性：持续演练（故障注入）、多活/容灾、自动化巡检与对账。
+  - 可靠性：持续演练（故障注入）、多活/容灾、自动化巡检与对账。  
+  - **降级/应急预案**：  
+    - 查询侧：缓存优先，DB 降级读只读实例；热点车次限流/灰度；关闭非核心接口。  
+    - 下单侧：排队限速，队列分区按车次/日期优先级出队（先来先服务+票量优先），队列长度与处理速率动态调节。  
+    - 库存侧：热点库存隔离 Key，必要时切换“仅排队接受，暂停扣减”模式；对账巡检加密度。  
+    - 支付/出票：回调重试与幂等保护，出票失败自动退款；可切流至备实例。  
+    - 数据库容灾：主备切换演练，跨 AZ 复制，读流量自动摘除故障分片。  
+    - 熔断与限流：基于 SLA/错误率的自适应熔断，保护下游；重试采用指数退避+幂等。  
+  - **运维与可观测**：  
+    - 指标：QPS/TPS、排队长度/等待时间、库存命中率、出票成功率、支付回调成功率、退款成功率、错误率、P95/P99 延迟、资源使用率。  
+    - 日志与脱敏：访问/业务/审计日志，敏感字段（证件号、手机号、姓名）脱敏或加密存储，最小留存期限策略。  
+    - 链路追踪：全链路 TraceID（网关注入），覆盖 RPC/MQ；采样+热点强制采样。  
+    - 告警：基于指标阈值、异常比率、队列堆积、回调失败、对账差异；多通道通知（短信/IM/电话）。  
+    - 压测：定期全链路压测/演练，独立压测流量与数据隔离；容量回归基线。  
+    - 安全与隐私：传输加密（TLS）、静态加密（数据库/对象存储敏感列）、密钥管理（KMS/HSM）、最小权限、接口频控/验证码、日志脱敏、访问审计。
 
 ---
 
