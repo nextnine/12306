@@ -126,7 +126,7 @@ flowchart LR
     Q --> Railway
     N --> Sms
 ```
-**图解**：展示客户端经 CDN/WAF 与 API Gateway 进入各业务域；订单/库存/座位/支付/出票/退改候补、风控与通知通过 Redis/Kafka/MySQL/ES/OSS 协作，并与外部实名/支付/运行图/短信等集成。
+**图解**：\n- 客户端（Web/APP/运营）首先经 CDN/WAF 抗 DDoS 与静态分发，再进入 API Gateway 做鉴权、限流、灰度与路由。\n- 网关将请求分发到业务域：查询（缓存+ES/DB）、订单（排队/幂等/状态机）、库存（预扣）、座位（锁座）、支付（支付单/回调）、出票、退改候补、风控/配置、通知。\n- 中间件层：Redis 做缓存/分布式锁；Kafka/RabbitMQ 传递事件（订单、库存、通知等）；MySQL 分片存 OLTP；ES 提供搜索；OSS 存放报表/归档。\n- 外部集成：支付网关回调推动订单/出票；实名核验；运行图/座席同步供查询与预扣；短信/邮件推送通知用户。
 
 #### 部署视图（高并发场景）
 ```mermaid
@@ -171,7 +171,7 @@ flowchart TB
     MQ --> NPod
     DB -.-> Backup[冷热备份/归档]
 ```
-**图解**：展示在 K8s 上的服务分片与中间件集群，Redis Cluster/Kafka 多分区/MySQL 分库分表/ES 集群，以及备份/归档链路，前置 CDN+LB+Gateway。
+**图解**：\n- 前端流量：CDN → LB → API Gateway，再进入 K8s 集群中的各微服务 Pod（查询、订单、库存、座位、支付、出票、退改候补、风控、通知）。\n- 数据/中间件：Redis Cluster（slot 分片+故障切换）、Kafka/RabbitMQ（多分区）、MySQL 分库分表（主从/Proxy）、ES 集群；对象存储/备份用于冷热归档。\n- 链路示意：各服务对 Redis/DB/ES 进行读写，对 Kafka 发送/消费事件（订单、库存、支付、通知）；备份/归档从数据库流向冷存储。\n- 可靠性：多 AZ 部署，中间件高可用，Pod 可横向扩展。
 
 ---
 
@@ -329,7 +329,7 @@ erDiagram
     string passenger_id
   }
 ```
-**图解**：ER 示意突出核心实体与关联：Train/SegmentInventory/SeatLock 管理车次与区间库存与锁座；Order 关联 OrderItem、Payment、Ticket、RefundChange、StandbyRequest；User/Passenger 关联订单与乘客信息；实体包含版本/金额/状态等关键字段。
+**图解**：\n- 车次域：TRAIN 对应多个 SEGMENTINVENTORY（按日期/区间/席别库存）和 SEATLOCK（锁座记录）。\n- 订单域：ORDER 关联 ORDERITEM（乘客/席别明细），一对一 PAYMENT（支付单）、一对多 TICKET（票号）、一对多 REFUNDCHANGE（退改）、一对多 STANDBYREQUEST（候补）。\n- 用户域：USER 与 PASSENGER 管理实名乘客，并与 ORDER 关联。\n- 关键字段：库存版本号（乐观锁）、金额（分）、状态/队列 token/幂等键，用于一致性与幂等控制。
 
 ### 时序（下单→支付→出票）
 ```mermaid
@@ -360,7 +360,7 @@ sequenceDiagram
     O->>N: 通知
     N-->>C: 送达短信/推送
 ```
-**图解**：时序展示下单→排队→预扣/锁座→支付→出票→通知链路，支付回调幂等驱动出票，通知收尾。
+**图解**：\n- 客户端提交下单，经网关透传幂等键/风控态到订单服务。\n- 订单服务调用库存预扣，成功后调用座位锁座（可选），返回 queue_token 给客户端。\n- 客户端轮询/推送查看排队进度；订单服务准备支付跳转。\n- 客户端完成支付，支付平台回调订单服务（幂等+验签），触发出票。\n- 出票服务出票成功/失败结果写回订单；通知服务发送短信/推送给用户。
 
 ### 状态机（订单/支付/出票）
 ```mermaid
@@ -377,7 +377,7 @@ flowchart LR
     R -->|退款完成| X
     CH -->|新票成功| D
 ```
-**图解**：状态机展示订单从 WAIT_PAY→PAID→TICKETING→SUCCESS/FAIL，支持退票/改签分支，失败后退款闭环。
+**图解**：\n- 订单初始 WAIT_PAY，支付成功进入 PAID，出票中为 TICKETING。\n- 出票成功进入 SUCCESS，失败进入 FAIL 并触发退款回补；支付超时/取消进入 CLOSED。\n- SUCCESS 可走退票（REFUND）或改签（CHANGE），退票完成回到 CLOSED；改签成功返回 SUCCESS（新票）。\n- 所有状态单向推进，保障幂等与可重复执行。
 
 ---
 
