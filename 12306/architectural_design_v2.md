@@ -126,6 +126,7 @@ flowchart LR
     Q --> Railway
     N --> Sms
 ```
+**图解**：展示客户端经 CDN/WAF 与 API Gateway 进入各业务域；订单/库存/座位/支付/出票/退改候补、风控与通知通过 Redis/Kafka/MySQL/ES/OSS 协作，并与外部实名/支付/运行图/短信等集成。
 
 #### 部署视图（高并发场景）
 ```mermaid
@@ -170,6 +171,7 @@ flowchart TB
     MQ --> NPod
     DB -.-> Backup[冷热备份/归档]
 ```
+**图解**：展示在 K8s 上的服务分片与中间件集群，Redis Cluster/Kafka 多分区/MySQL 分库分表/ES 集群，以及备份/归档链路，前置 CDN+LB+Gateway。
 
 ---
 
@@ -327,6 +329,7 @@ erDiagram
     string passenger_id
   }
 ```
+**图解**：ER 示意突出核心实体与关联：Train/SegmentInventory/SeatLock 管理车次与区间库存与锁座；Order 关联 OrderItem、Payment、Ticket、RefundChange、StandbyRequest；User/Passenger 关联订单与乘客信息；实体包含版本/金额/状态等关键字段。
 
 ### 时序（下单→支付→出票）
 ```mermaid
@@ -357,6 +360,7 @@ sequenceDiagram
     O->>N: 通知
     N-->>C: 送达短信/推送
 ```
+**图解**：时序展示下单→排队→预扣/锁座→支付→出票→通知链路，支付回调幂等驱动出票，通知收尾。
 
 ### 状态机（订单/支付/出票）
 ```mermaid
@@ -373,6 +377,7 @@ flowchart LR
     R -->|退款完成| X
     CH -->|新票成功| D
 ```
+**图解**：状态机展示订单从 WAIT_PAY→PAID→TICKETING→SUCCESS/FAIL，支持退票/改签分支，失败后退款闭环。
 
 ---
 
