@@ -6,7 +6,7 @@
 - `12306/guide.md`：软件文档编写指南。  
 - `12306/gpt生成文档/需求分析文档.md`：需求规格说明（SRS），含功能、性能与接口约束。  
 - `12306/gpt生成文档/系统设计文档.md`：概要设计说明（ADS），含核心流程、组件/部署视图、接口示例。  
-- `12306/mgx生成文档/requirements_analysis_v13.md`、`system_design_v13.md`：另一版需求与设计草案。  
+- `12306/mgx生成文档/requirements_analysis_v13.md`、`system_design_v13.md`：另一版需求与设计草案。（未选用）  
 - `12306/需求分析与系统设计报告v.docx`：需求与设计报告的 Word 版本。  
 
 ## 核心需求要点（摘自 SRS）
