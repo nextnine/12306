@@ -26,48 +26,59 @@
 ## 一．引言
 1. 编写目的：提供高并发火车票购票系统的高层架构、关键策略、模型与演化决策，指导后续详细设计与实现，读者包括架构/开发/测试/运维。强调与 SRS/测试计划的衔接，使设计可验证、可实施。  
 2. 项目背景：春运/节假日高峰，对接铁路运行图/实名/支付/通知等外部系统；委托/开发/运维单位协同。突出对外依赖的 SLA 与容量约束，以及开售窗口的弹性与降级准备。  
-3. 定义：  
-| 术语/缩写 | 解释 |  
-| --- | --- |  
-| 区间段 Segment | 相邻站点的最小扣减单元。 |  
-| 区间票 | 跨多个区间段的票，扣减只能全成全败。 |  
-| 预扣库存 | 在缓存或分布式存储中的原子扣减，待支付后落库确认。 |  
-| 锁座 | 占用具体席位，支付超时自动释放。 |  
-| 幂等键 Idempotent Key | 请求唯一指纹，避免重复执行。 |  
-| 排队 Token | 进入削峰排队后的查询凭据。 |  
-| 订单状态机 | 订单、支付、出票状态的有限状态流转。 |  
-| QPS/TPS | 每秒查询/事务数。 |  
-| TTL | 生存时间。 |  
-| AZ | 可用区。 |  
-| DLQ | 死信队列。 |  
-| SLO/SLA | 服务水平目标/协议。 |  
-关键架构决策记录在 ADR，术语保持与数据模型和接口字段一致，减少歧义。  
-4. 参考资料：  
-| 标识 | 来源 | 说明 |  
-| --- | --- | --- |  
-| [DOC] | 项目任务书、合同、SRS、测试计划（初稿）、用户操作手册（初稿） | 作为设计输入与验收依据。 |  
-| [INT] | 内部安全、日志、加密规范 | 约束数据安全、审计与合规。 |  
-| [EXT] | 铁路运行图/实名/支付/短信等外部接口协议与验签规范 | 约束对外集成的字段、签名与 SLA。 |  
-| [BASE] | 历史压测与容量评估数据 | 提供性能与容量基线，用于规划与验证。 |  
-| [^sre] | 《Site Reliability Engineering》；《The Site Reliability Workbook》 | 支撑 SLO、延迟目标、错误预算与过载管理。 |  
-| [^ddia] | 《Designing Data-Intensive Applications》 | 支撑一致性、分片、对账与流处理设计。 |  
-| [^dbmq] | MySQL 8.0 Manual；Elasticsearch 指南；Redis Cluster 规范；Kafka/RabbitMQ 文档 | 支撑存储分片、索引、原子性与消息幂等/顺序/DLQ。 |  
-| [^mq] | Kafka/RabbitMQ 文档（分区有序、DLQ、回溯） | 支撑事件分区与重试/回溯策略。 |  
-| [^cache] | 《Release It!》；Nginx/Envoy 缓存与限流指南 | 支撑缓存隔离、熔断与限流策略。 |  
-| [^idemp] | IETF RFC 7231/9110；AWS/支付网关幂等键实践 | 支撑接口幂等与重放防护。 |  
-| [^fault] | 《Release It!》；Resilience4j/Hystrix 文档；IETF RFC 9110/7231 | 支撑超时、退避、熔断、降级与错误码语义。 |  
-| [^queue] | 《Site Reliability Engineering》；《The Site Reliability Workbook》；Nginx/Envoy 限流指南 | 支撑排队削峰与令牌桶/漏桶策略。 |  
-| [^security] | OWASP ASVS v4.0；ISO/IEC 27001:2022 附录 A | 覆盖认证、加密、日志、隐私与访问控制。 |  
+3. 定义：
 
-[^sre]: 《Site Reliability Engineering》，第 4 章“Service Level Objectives”；《The Site Reliability Workbook》，第 5 章“SLOs”。  
-[^ddia]: 《Designing Data-Intensive Applications》，第 5 章“Replication”、第 6 章“Partitioning”、第 9 章“Consistency and Consensus”、第 11 章“Stream Processing”。  
-[^dbmq]: MySQL 8.0 Reference Manual 第 18 章“Group Replication/Partitioning”；Elasticsearch 官方指南与《Elasticsearch: The Definitive Guide》扩展/索引章节；Redis Cluster 规范与 Lua/EVAL 原子性章节；Kafka 文档“Design/Replication/Producer Idempotence/Exactly-Once Semantics”；RabbitMQ 文档“Dead Letter Exchanges/Quorum queues/Retry & DLQ”。  
-[^mq]: Kafka/RabbitMQ 官方文档对分区有序、幂等、DLQ/延迟队列与回溯重放的说明。  
-[^cache]: 《Release It!》（2nd Edition）第 5 章“Stability Patterns”；Nginx `proxy_cache`/`limit_req` 与 Envoy Rate Limit/缓存官方配置指南；大规模缓存实践文章。  
-[^idemp]: IETF RFC 7231/9110 幂等语义章节；AWS API/支付网关幂等键实践（如 Stripe/PayPal/支付宝/微信支付）。  
-[^fault]: 《Release It!》（2nd Edition）第 5 章“Stability Patterns”；Resilience4j/Hystrix 官方文档（CircuitBreaker/Retry/RateLimiter/Bulkhead）；IETF RFC 9110/7231 第 15 章 HTTP 状态码语义。  
-[^queue]: 《Site Reliability Engineering》容量与过载管理章节；《The Site Reliability Workbook》第 15 章“Handling Overload”；Nginx `limit_req`/Envoy Rate Limit 过滤器指南；令牌桶/漏桶算法经典描述。  
-[^security]: OWASP ASVS v4.0（认证、加密、日志与审计控制）与 ISO/IEC 27001:2022 附录 A 涵盖访问控制、日志与隐私的条目。  
+   | 术语/缩写 | 解释 |
+   | --- | --- |
+   | 区间段 Segment | 相邻站点的最小扣减单元。 |
+   | 区间票 | 跨多个区间段的票，扣减只能全成全败。 |
+   | 预扣库存 | 在缓存或分布式存储中的原子扣减，待支付后落库确认。 |
+   | 锁座 | 占用具体席位，支付超时自动释放。 |
+   | 幂等键 Idempotent Key | 请求唯一指纹，避免重复执行。 |
+   | 排队 Token | 进入削峰排队后的查询凭据。 |
+   | 订单状态机 | 订单、支付、出票状态的有限状态流转。 |
+   | QPS/TPS | 每秒查询/事务数。 |
+   | TTL | 生存时间。 |
+   | AZ | 可用区。 |
+   | DLQ | 死信队列。 |
+   | SLO/SLA | 服务水平目标/协议。 |
+ 
+4. 参考资料：
+
+   | 标识 | 来源 | 说明 |
+   | --- | --- | --- |
+   | [GUIDE] | 《南京大学软件文档编写指南》 | 规定需求规格/概要设计等文档结构与“参考资料”应包含的材料类型，用于统一写作口径与评审检查清单。 |
+   | [DOC-01] | 项目任务书 | 需求来源、目标与交付边界依据。 |
+   | [DOC-02] | 合同 / 批文 / 立项文件（如有） | 责任边界、验收口径、合规与里程碑约束。 |
+   | [DOC-03] | 《需求规格说明书（SRS）》 | 本概要/详细设计、测试计划与验收标准的需求输入与追溯源。 |
+   | [DOC-04] | 《概要设计说明书（ADS）》 | 模块划分、关键策略与接口边界的高层依据（供实现/测试/运维对齐）。 |
+   | [SEC-01] | 内部安全/加密规范 | 账号权限、密钥管理、加密与脱敏要求依据。 |
+   | [SEC-02] | 内部日志与审计规范 | 审计字段、留存周期、检索与取证要求依据。 |
+   | [EXT-01] | 铁路运行图/余票库存外部接口协议 | 查询/扣减/释放等接口契约、限流、错误码与 SLA 约束。 |
+   | [EXT-02] | 实名核验接口协议与验签规范 | 实名字段、验签、幂等/重放防护与 SLA 约束。 |
+   | [EXT-03] | 支付/退款/回调接口协议与验签规范 | 回调验签、幂等、对账与 SLA/容量约束。 |
+   | [EXT-04] | 短信/站内信/Push 通知接口协议 | 触达通道的限流、回执与降级策略依据。 |
+   | [BASE-01] | 历史压测报告与容量评估数据 | 性能基线、容量模型、扩容与降级阈值校准依据。 |
+   | [SRE-01] | 《Site Reliability Engineering》 | SLO/错误预算、过载保护与可观测性方法论依据。 |
+   | [SRE-02] | 《The Site Reliability Workbook》 | SLO 落地、告警与运行手册/演练方法论依据。 |
+   | [ARCH-01] | 《Designing Data-Intensive Applications》 | 一致性、分片、日志/事件流与补偿思路依据。 |
+   | [DB-01] | MySQL 8.0 Reference Manual | 事务/隔离级别、复制、分区等实现约束依据。 |
+   | [DB-02] | Elasticsearch 官方文档 | 索引设计、查询/聚合与容量规划依据。 |
+   | [CACHE-01] | Redis Cluster 规范/官方文档 | 集群、Lua 原子性、过期与一致性折衷依据。 |
+   | [MQ-01] | Kafka 官方文档 | 顺序、幂等生产/事务语义、重试与 DLQ 思路依据。 |
+   | [MQ-02] | RabbitMQ 官方文档 | 死信队列、重试、可靠投递与消费语义依据。 |
+   | [STD-31502] | GB/T 31502-2015（电子支付系统相关安全要求） | 支付安全域/审计/安全保证等要求参考（用于支付链路与安全设计对齐）。 |
+   | [STD-35273] | GB/T 35273-2020（个人信息安全规范） | 个人信息处理、最小化、授权与保护要求参考（用于隐私/脱敏/留存设计对齐）。 |
+   | [STD-36964] | GB/T 36964-2018 | 作为本项目引用的国家标准之一（按需映射到安全/合规模块条款）。 |
+   | [STD-41460] | GB/T 41460-2022 | 作为本项目引用的国家标准之一（按需映射到支付/安全能力条款）。 |
+   | [STD-41463] | GB/T 41463-2022 | 作为本项目引用的国家标准之一（按需映射到应急/连续性/管理要求）。 |
+   | [STD-42015] | GB/T 42015-2022 | 作为本项目引用的国家标准之一（按需映射到支付/接口安全要求）。 |
+   | [STD-42582] | GB/T 42582-2023 | 作为本项目引用的国家标准之一（按需映射到客户端/个人信息合规要求）。 |
+   | [STD-43578] | GB/T 43578-2023（通用密码服务接口） | 签名验签/摘要/加解密等密码接口与验证方法参考（用于验签与密钥使用对齐）。 |
+   | [ISO-4217] | ISO 4217 | 货币编码与最小货币单位表达参考（金额统一以分/cent 存储与传输）。 |
+   | [ISO-8601] | ISO 8601:2019 / RFC 3339 | 时间格式与时区表示参考（接口与日志统一时间标准）。 |
+   | [HTTP] | IETF RFC 9110 / RFC 7231 | HTTP 语义、状态码与缓存/重试语义参考。 |
+
 
 ---
 
