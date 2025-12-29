@@ -95,7 +95,7 @@ flowchart LR
       O[Order\n排队/幂等/状态机]
       I[Inventory\n区间库存预扣]
       S[Seat\n锁座/释放]
-      P[Payment\n支付单/回调幂等]
+      PS[PaymentSvc\n支付单/回调幂等]
       T[Ticketing\n出票/补偿]
       A[After-sales\n退改/候补]
       R[Risk & Config\n风控/策略]
@@ -111,7 +111,7 @@ flowchart LR
     end
 
     subgraph External[外部系统]
-      Pay[支付网关]
+      PayGateway[支付网关]
       Verify[实名/证件核验]
       Railway[铁路运行图/座席]
       Sms[短信/邮件/推送渠道]
@@ -122,10 +122,10 @@ flowchart LR
     Ops --> GW
     CDN --> GW
 
-    GW --> Q & O & P & A & R
+    GW --> Q & O & PS & A & R
     O --> I --> S
-    O --> P
-    P --> T
+    O --> PS
+    PS --> T
     T --> N
     A --> I
     Q --> ES
@@ -134,22 +134,22 @@ flowchart LR
     I --> Redis
     I --> MQ
     O --> MQ
-    P --> MQ
+    PS --> MQ
     N --> MQ
     MQ --> T
     MQ --> A
     DB --> OSS
 
-    P --> Pay
+    PS --> PayGateway
     R --> Verify
     Q --> Railway
     N --> Sms
 ```
 **图解**：
 - 客户端（Web/APP/运营）经 CDN/WAF 抗 DDoS 与静态分发，再进入 API Gateway 做鉴权、限流、灰度与路由。
-- 网关分发到业务域：查询（缓存+ES/DB）、订单（排队/幂等/状态机）、库存（预扣）、座位（锁座）、支付（支付单/回调）、出票、退改候补、风控/配置、通知。
+- 网关分发到业务域：查询（缓存+ES/DB）、订单（排队/幂等/状态机）、库存（预扣）、座位（锁座）、支付服务 PaymentSvc（支付单/回调）、出票、退改候补、风控/配置、通知。
 - 中间件：Redis 缓存/分布式锁；Kafka/RabbitMQ 承载订单、库存、通知等事件；MySQL 分片存 OLTP；ES 搜索；OSS 报表/归档。
-- 外部集成：支付回调驱动订单/出票；实名核验；运行图/座席同步供查询与预扣；短信/邮件推送通知。
+- 外部集成：PayGateway 回调驱动订单/出票；实名核验；运行图/座席同步供查询与预扣；短信/邮件推送通知。
 
 #### 部署视图（高并发场景）
 ```mermaid
@@ -163,7 +163,7 @@ flowchart TB
       OPod[Order Pods]
       IPod[Inventory Pods]
       SPod[Seat Pods]
-      PPod[Payment Pods]
+    PPod[PaymentSvc Pods]
       TPod[Ticketing Pods]
       APod[After-sales Pods]
       RPod[Risk Pods]
@@ -195,7 +195,7 @@ flowchart TB
     DB -.-> Backup[冷热备份/归档]
 ```
 **图解**：
-- 前端流量：CDN → LB → API Gateway，再进入 K8s 中的各微服务 Pod（查询、订单、库存、座位、支付、出票、退改候补、风控、通知）。
+- 前端流量：CDN → LB → API Gateway，再进入 K8s 中的各微服务 Pod（查询、订单、库存、座位、PaymentSvc、出票、退改候补、风控、通知）。
 - 数据/中间件：Redis Cluster（slot 分片+故障切换）、Kafka/RabbitMQ（多分区）、MySQL 分库分表（主从/Proxy）、ES 集群；对象存储/备份用于冷热归档。
 - 链路：服务读写 Redis/DB/ES，向 Kafka 发送/消费订单、库存、通知等事件；备份/归档从数据库流向冷存储。
 - 可靠性：多 AZ 部署，中间件高可用，Pod 横向扩展。
@@ -240,15 +240,25 @@ erDiagram
     string queue_token
     string idempotent_key
     datetime expire_at
-    int amount
+    long amount_fen
   }
   PAYMENT {
     string id
     string order_id
     string channel
     string status
-    int amount
+    long amount_fen
     int notify_version
+  }
+  SEATLOCK {
+    string id
+    string train_no
+    date run_date
+    string segment_id
+    string seat_no
+    string seat_class
+    string status
+    datetime expire_at
   }
   TICKET {
     string id
@@ -261,7 +271,7 @@ erDiagram
 - 车次域：TRAIN 关联多个 SEGMENTINVENTORY（按日期/区间/席别库存）与 SEATLOCK（锁座记录）。
 - 订单域：ORDER 关联 ORDERITEM（乘客/席别明细），一对一 PAYMENT（支付单）、一对多 TICKET（票号）、一对多 REFUNDCHANGE（退改）、一对多 STANDBYREQUEST（候补）。
 - 用户域：USER 与 PASSENGER 管理实名乘客，并与 ORDER 关联。
-- 关键字段：库存版本号（乐观锁）、金额（分）、状态/队列 token/幂等键，用于一致性与幂等控制。
+- 关键字段：库存版本号（乐观锁）、金额（long、分）、状态/队列 token/幂等键，用于一致性与幂等控制。
 
 #### 时序（下单→支付→出票）
 ```mermaid
@@ -272,7 +282,8 @@ sequenceDiagram
     participant O as Order Service
     participant I as Inventory
     participant S as Seat
-    participant P as Payment
+    participant PS as PaymentSvc
+    participant PG as PayGateway
     participant T as Ticketing
     participant N as Notification
     C->>GW: 提交下单请求
@@ -285,8 +296,10 @@ sequenceDiagram
     C->>GW: 轮询/推送查询 queue_token
     GW->>O: 读取排队状态
     O-->>C: 返回支付跳转
-    C->>P: 调起支付
-    P-->>O: 回调（幂等）
+    C->>PS: 调起支付
+    PS->>PG: 支付网关请求
+    PG-->>PS: 支付结果/回调
+    PS-->>O: 支付结果回传（幂等）
     O->>T: 触发出票
     T-->>O: 出票结果
     O->>N: 通知
@@ -296,7 +309,7 @@ sequenceDiagram
 - 客户端提交下单，经网关透传幂等键/风控态到订单服务。
 - 订单服务调用库存预扣，成功后可选调用座位锁座，返回 queue_token。
 - 客户端轮询/推送查询 queue_token，订单服务准备支付跳转。
-- 客户端支付后，支付平台回调订单服务（幂等+验签），触发出票。
+- 客户端支付后，PaymentSvc 与 PayGateway 完成回调交互，再将幂等且验签后的支付结果传递给订单服务，触发出票。
 - 出票结果写回订单；通知服务向用户发送短信/推送。
 
 #### 状态机（订单/支付/出票）
@@ -341,6 +354,7 @@ flowchart LR
 ### 1．逻辑结构设计
 - 缓存分层与热点治理：浏览器/APP 本地缓存→CDN/边缘→Gateway 本地缓存→Redis（5~20s TTL，二级本地缓存 200~500ms，弱一致）→只读库/ES；防击穿/雪崩：随机 TTL、请求合并、预热、兜底；版本戳/校验和纠偏。[^7]  
 - 库存一致性/防超卖：区间库存 Redis Lua 原子预扣+版本号；写侧单线程/分片顺序消费 MQ 回写 MySQL 账本；定时对账与差值告警；支付超时/出票失败原路回补。[^5][^8][^9]  
+- 金额与时间：金额统一 `long amount_fen` 存储，币种独立字段对齐接口契约；时间字段采用 ISO8601（含时区）并依赖统一时钟服务。[^10][^11][^12]  
 - 幂等：入口 `idempotent_key`+`queue_token`（15 分钟），幂等记录在线 7 天、归档 30 天；状态只能前进。[^13]  
 - 支付回调：签名+幂等，指数退避重试（1/2/4/8... 最多 6~8 次），落库失败入 DLQ。[^2][^3]  
 - 排队与削峰：入口频控（账号/设备 3 QPS，突发桶 10），队列上限 5 万/车次/日，出队速率 `min(2%*remain, 2000)` 单/秒，超长转候补。[^3]  
@@ -416,6 +430,9 @@ flowchart LR
 [^7]: 参考资料 7 Redis Cluster 官方文档
 [^8]: 参考资料 8 Kafka 官方文档
 [^9]: 参考资料 9 RabbitMQ 官方文档
+[^10]: 参考资料 10 ISO 4217
+[^11]: 参考资料 11 ISO 8601:2019
+[^12]: 参考资料 12 RFC 3339
 [^13]: 参考资料 13 RFC 9110
 [^15]: 参考资料 15 《个人信息安全规范》
 [^19]: 参考资料 19 《通用密码服务接口规范》
