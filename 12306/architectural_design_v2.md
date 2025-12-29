@@ -24,26 +24,50 @@
 
 
 ## 一．引言
-1. 编写目的：本文档给出高并发火车票购票系统的概要架构：系统边界、模块划分、关键链路与核心设计策略，用于指导详细设计与实现落地。读者包括架构、研发、测试、运维与联调合作方；文档重点回答“如何在开售峰值下保证可用性与一致性、如何治理外部依赖、如何降级与恢复、如何观测与审计”。本文与 SRS、测试计划建立可追溯关系：关键架构决策（限流/排队、幂等、验签、防重放、补偿、可观测与审计、故障演练）必须在测试计划中映射为可执行验证项，并在上线后通过监控指标、日志样例、压测/演练报告形成可核验证据。 
-2. 项目背景：开售窗口（春运/节假日）产生短时极端峰值，对系统弹性扩展、链路稳定性与故障快速恢复提出要求。系统对接铁路运行图/余票与席位资源、实名核验、支付与退款、通知触达、风控等外部系统，交付由委托/开发/运维单位协同完成，因此必须将外部依赖的 SLA、容量上限、限流策略与故障模式 作为架构输入。设计需在峰值前完成容量评估与压测基线，并准备弹性与降级预案：核心链路优先（查询/下单/支付关键路径），非关键能力可延后或异步（通知、画像、部分风控增强）。所有关键链路需提供可追踪与可审计证据，支撑上线后故障定位、复盘与合规检查。
-3. 定义：
+1. 编写目的：提供高并发火车票购票系统的高层架构、关键策略、模型与演化决策，指导后续详细设计与实现，读者包括架构/开发/测试/运维。强调与 SRS/测试计划的衔接，使设计可验证、可实施。  
+2. 项目背景：春运/节假日高峰，对接铁路运行图/实名/支付/通知等外部系统；委托/开发/运维单位协同。突出对外依赖的 SLA 与容量约束，以及开售窗口的弹性与降级准备。  
+3. 定义：  
+| 术语/缩写 | 解释 |  
+| --- | --- |  
+| 区间段 Segment | 相邻站点的最小扣减单元。 |  
+| 区间票 | 跨多个区间段的票，扣减只能全成全败。 |  
+| 预扣库存 | 在缓存或分布式存储中的原子扣减，待支付后落库确认。 |  
+| 锁座 | 占用具体席位，支付超时自动释放。 |  
+| 幂等键 Idempotent Key | 请求唯一指纹，避免重复执行。 |  
+| 排队 Token | 进入削峰排队后的查询凭据。 |  
+| 订单状态机 | 订单、支付、出票状态的有限状态流转。 |  
+| QPS/TPS | 每秒查询/事务数。 |  
+| TTL | 生存时间。 |  
+| AZ | 可用区。 |  
+| DLQ | 死信队列。 |  
+| SLO/SLA | 服务水平目标/协议。 |  
+关键架构决策记录在 ADR，术语保持与数据模型和接口字段一致，减少歧义。  
+4. 参考资料：  
+| 标识 | 来源 | 说明 |  
+| --- | --- | --- |  
+| [DOC] | 项目任务书、合同、SRS、测试计划（初稿）、用户操作手册（初稿） | 作为设计输入与验收依据。 |  
+| [INT] | 内部安全、日志、加密规范 | 约束数据安全、审计与合规。 |  
+| [EXT] | 铁路运行图/实名/支付/短信等外部接口协议与验签规范 | 约束对外集成的字段、签名与 SLA。 |  
+| [BASE] | 历史压测与容量评估数据 | 提供性能与容量基线，用于规划与验证。 |  
+| [^sre] | 《Site Reliability Engineering》；《The Site Reliability Workbook》 | 支撑 SLO、延迟目标、错误预算与过载管理。 |  
+| [^ddia] | 《Designing Data-Intensive Applications》 | 支撑一致性、分片、对账与流处理设计。 |  
+| [^dbmq] | MySQL 8.0 Manual；Elasticsearch 指南；Redis Cluster 规范；Kafka/RabbitMQ 文档 | 支撑存储分片、索引、原子性与消息幂等/顺序/DLQ。 |  
+| [^mq] | Kafka/RabbitMQ 文档（分区有序、DLQ、回溯） | 支撑事件分区与重试/回溯策略。 |  
+| [^cache] | 《Release It!》；Nginx/Envoy 缓存与限流指南 | 支撑缓存隔离、熔断与限流策略。 |  
+| [^idemp] | IETF RFC 7231/9110；AWS/支付网关幂等键实践 | 支撑接口幂等与重放防护。 |  
+| [^fault] | 《Release It!》；Resilience4j/Hystrix 文档；IETF RFC 9110/7231 | 支撑超时、退避、熔断、降级与错误码语义。 |  
+| [^queue] | 《Site Reliability Engineering》；《The Site Reliability Workbook》；Nginx/Envoy 限流指南 | 支撑排队削峰与令牌桶/漏桶策略。 |  
+| [^security] | OWASP ASVS v4.0；ISO/IEC 27001:2022 附录 A | 覆盖认证、加密、日志、隐私与访问控制。 |  
 
-   | 术语/缩写 | 解释 |
-   | --- | --- |
-   | 区间段 Segment | 相邻站点的最小扣减单元。 |
-   | 区间票 | 跨多个区间段的票，扣减只能全成全败。 |
-   | 预扣库存 | 在缓存或分布式存储中的原子扣减，待支付后落库确认。 |
-   | 锁座 | 占用具体席位，支付超时自动释放。 |
-   | 幂等键 Idempotent Key | 请求唯一指纹，避免重复执行。 |
-   | 排队 Token | 进入削峰排队后的查询凭据。 |
-   | 订单状态机 | 订单、支付、出票状态的有限状态流转。 |
-   | QPS/TPS | 每秒查询/事务数。 |
-   | TTL | 生存时间。 |
-   | AZ | 可用区。 |
-   | DLQ | 死信队列。 |
-   | SLO/SLA | 服务水平目标/协议。 |
-
-4. 参考资料：项目任务书/合同（如有）；SRS；测试计划（初稿）；用户操作手册（初稿）；国家/行业规范（实名、安全、隐私、支付相关）；外部接口协议与验签规范（铁路运行图/实名/支付/短信）；内部安全/日志/加密规范；历史压测与容量评估数据。引用资料在设计评审前确认版本与适用性，变更同步到设计。  
+[^sre]: 《Site Reliability Engineering》，第 4 章“Service Level Objectives”；《The Site Reliability Workbook》，第 5 章“SLOs”。  
+[^ddia]: 《Designing Data-Intensive Applications》，第 5 章“Replication”、第 6 章“Partitioning”、第 9 章“Consistency and Consensus”、第 11 章“Stream Processing”。  
+[^dbmq]: MySQL 8.0 Reference Manual 第 18 章“Group Replication/Partitioning”；Elasticsearch 官方指南与《Elasticsearch: The Definitive Guide》扩展/索引章节；Redis Cluster 规范与 Lua/EVAL 原子性章节；Kafka 文档“Design/Replication/Producer Idempotence/Exactly-Once Semantics”；RabbitMQ 文档“Dead Letter Exchanges/Quorum queues/Retry & DLQ”。  
+[^mq]: Kafka/RabbitMQ 官方文档对分区有序、幂等、DLQ/延迟队列与回溯重放的说明。  
+[^cache]: 《Release It!》（2nd Edition）第 5 章“Stability Patterns”；Nginx `proxy_cache`/`limit_req` 与 Envoy Rate Limit/缓存官方配置指南；大规模缓存实践文章。  
+[^idemp]: IETF RFC 7231/9110 幂等语义章节；AWS API/支付网关幂等键实践（如 Stripe/PayPal/支付宝/微信支付）。  
+[^fault]: 《Release It!》（2nd Edition）第 5 章“Stability Patterns”；Resilience4j/Hystrix 官方文档（CircuitBreaker/Retry/RateLimiter/Bulkhead）；IETF RFC 9110/7231 第 15 章 HTTP 状态码语义。  
+[^queue]: 《Site Reliability Engineering》容量与过载管理章节；《The Site Reliability Workbook》第 15 章“Handling Overload”；Nginx `limit_req`/Envoy Rate Limit 过滤器指南；令牌桶/漏桶算法经典描述。  
+[^security]: OWASP ASVS v4.0（认证、加密、日志与审计控制）与 ISO/IEC 27001:2022 附录 A 涵盖访问控制、日志与隐私的条目。  
 
 ---
 
@@ -271,16 +295,6 @@ flowchart TB
 - 部署与变更：无状态服务滚动发布、灰度与回滚；健康检查与自动故障转移。发布具备自动化校验与回滚剧本，支持蓝绿/金丝雀，变更窗口配合审批与冻结策略。  
 - 运行手册：压测与演练（排队/支付/回调/出票链路）、容量预测与再分片计划。手册包含日常巡检、常见故障处理、压测数据隔离、分片扩容步骤与演练清单。  
 
-## 参考与注释
-- [^sre] 《Site Reliability Engineering》，第 4 章“Service Level Objectives”；《The Site Reliability Workbook》，第 5 章“SLOs”——用于 SLO、延迟/错误预算与过载控制基准。  
-- [^ddia] 《Designing Data-Intensive Applications》，第 5 章“Replication”、第 6 章“Partitioning”、第 9 章“Consistency and Consensus”、第 11 章“Stream Processing”——用于一致性、分片、对账/补偿与流处理设计。  
-- [^dbmq] MySQL 8.0 Reference Manual 第 18 章“Group Replication/Partitioning”；Elasticsearch 官方指南与《Elasticsearch: The Definitive Guide》扩展/索引章节；Redis Cluster 规范与 Lua/EVAL 原子性章节；Kafka 文档“Design/Replication/Producer Idempotence/Exactly-Once Semantics”；RabbitMQ 文档“Dead Letter Exchanges/Quorum queues/Retry & DLQ”。  
-- [^mq] Kafka/RabbitMQ 官方文档对分区有序、幂等、DLQ/延迟队列与回溯重放的说明。  
-- [^cache] 《Release It!》（2nd Edition）第 5 章“Stability Patterns”（缓存/隔离/熔断）；Nginx `proxy_cache`/`limit_req` 与 Envoy Rate Limit/缓存官方配置指南；大规模缓存实践文章。  
-- [^idemp] IETF RFC 7231/9110 幂等语义章节；AWS API/支付网关幂等键实践（如 Stripe/PayPal/支付宝/微信支付）。  
-- [^fault] 《Release It!》（2nd Edition）第 5 章“Stability Patterns”；Resilience4j/Hystrix 官方文档（CircuitBreaker/Retry/RateLimiter/Bulkhead）；IETF RFC 9110/7231 第 15 章 HTTP 状态码语义。  
-- [^queue] 《Site Reliability Engineering》容量与过载管理章节；《The Site Reliability Workbook》第 15 章“Handling Overload”；Nginx `limit_req`/Envoy Rate Limit 过滤器指南；令牌桶/漏桶算法经典描述。  
-- [^security] OWASP ASVS v4.0（认证、加密、日志与审计控制）与 ISO/IEC 27001:2022 附录 A 涵盖访问控制、日志与隐私的条目。  
 
 ---
 

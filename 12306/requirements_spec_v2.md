@@ -23,26 +23,44 @@
 ---
 
 ## 一．引言
-1. 编写目的：本需求说明书用于定义高并发火车票购票系统的业务范围、功能需求与非功能性要求，为产品、架构、研发、测试与运维提供统一依据。本文档作为后续系统设计、开发实现、测试验证、上线交付与验收评审的基准文件，支持需求项到设计实现、测试用例与验收标准的可追溯。本文档同时明确外部依赖与约束（铁路运行图/库存、实名核验、支付、通知、风控等），并给出关键假设与边界条件，用于联调计划、容量评估与风险控制。涉及个人信息与支付安全等内容时，系统应遵循适用的国家/行业标准及组织安全规范，并以可核验的过程证据（日志、审计记录、测试报告、演练记录等）支撑验收。
-2. 项目背景：春运及节假日开售窗口会出现短时间极端峰值流量，对系统并发承载、稳定性、库存一致性与支付链路可靠性提出更高要求。本项目由委托单位、开发单位与运维单位协同建设，系统需对接铁路运行图/余票库存、实名核验、支付与退款、通知触达、风控反作弊等外部系统，形成端到端闭环。由于外部系统存在延迟、限流与不确定性，系统需具备限流/熔断/重试/补偿等容错机制，并为关键链路提供可观测、可审计的证据。项目需兼顾平峰成本与峰值弹性，确保在极端流量下核心功能可用且用户体验可接受。
-3. 定义：
+1. 编写目的：阐明本需求说明书的目的，供产品、架构、设计、测试、运维等读者使用，作为设计与验收依据。  
+2. 项目背景：春运/节假日高并发售票需求；委托/开发/运维单位共同建设；系统对接铁路运行图、实名、支付、通知、风控等外部系统。  
+3. 定义与缩写：  
+| 术语/缩写 | 解释 |  
+| --- | --- |  
+| 区间段 Segment | 相邻站点的最小扣减单元。 |  
+| 区间票 | 跨多个区间段的票，扣减只能全成全败。 |  
+| 预扣库存 | 在缓存或分布式存储中的原子扣减，待支付后落库确认。 |  
+| 锁座 | 占用具体席位，支付超时自动释放。 |  
+| 幂等键 Idempotent Key | 请求唯一指纹，避免重复执行。 |  
+| 排队 Token | 进入削峰排队后的查询凭据。 |  
+| 订单状态机 | 订单、支付、出票状态的有限状态流转。 |  
+| QPS/TPS | 每秒查询/事务数。 |  
+| TTL | 生存时间。 |  
+| AZ | 可用区。 |  
+| DLQ | 死信队列。 |  
+| SLO/SLA | 服务水平目标/协议。 |  
+4. 参考资料：  
+| 标识 | 来源 | 说明 |  
+| --- | --- | --- |  
+| [DOC] | 项目任务书、合同、内部安全/加密/日志审计规范 | 作为建设依据与内部统一规范。 |  
+| [EXT] | 支付、实名、短信等外部接口协议与验签规范 | 约束对外接口字段、签名与 SLA。 |  
+| [BASE] | 历史压测与运营数据 | 提供性能与容量基线，用于目标设定与校准。 |  
+| [^sre] | 《Site Reliability Engineering》；《The Site Reliability Workbook》 | 支撑 SLO、延迟目标与错误预算。 |  
+| [^ddia] | 《Designing Data-Intensive Applications》 | 支撑一致性、账本化与流补偿思路。 |  
+| [^dbmq] | MySQL 8.0 Manual；Elasticsearch 指南；Redis Cluster 规范；Kafka/RabbitMQ 文档 | 支撑存储分片、索引、原子性与消息幂等/顺序/DLQ。 |  
+| [^currency] | ISO 4217；Stripe/PayPal/支付宝/微信支付 API | 约定金额使用最小货币单位（分/cent）。 |  
+| [^iso] | ISO 8601:2019；RFC 3339 | 约定时间格式与时区表示。 |  
+| [^fault] | 《Release It!》；Resilience4j/Hystrix 文档；IETF RFC 9110/7231 | 支撑超时、退避、熔断、降级与错误码语义。 |  
+| [^queue] | 《Site Reliability Engineering》；《The Site Reliability Workbook》；Nginx/Envoy 限流指南 | 支撑容量管理、排队削峰与令牌桶/漏桶策略。 |  
 
-   | 术语/缩写 | 解释 |
-   | --- | --- |
-   | 区间段 Segment | 相邻站点的最小扣减单元。 |
-   | 区间票 | 跨多个区间段的票，扣减只能全成全败。 |
-   | 预扣库存 | 在缓存或分布式存储中的原子扣减，待支付后落库确认。 |
-   | 锁座 | 占用具体席位，支付超时自动释放。 |
-   | 幂等键 Idempotent Key | 请求唯一指纹，避免重复执行。 |
-   | 排队 Token | 进入削峰排队后的查询凭据。 |
-   | 订单状态机 | 订单、支付、出票状态的有限状态流转。 |
-   | QPS/TPS | 每秒查询/事务数。 |
-   | TTL | 生存时间。 |
-   | AZ | 可用区。 |
-   | DLQ | 死信队列。 |
-   | SLO/SLA | 服务水平目标/协议。 |
-
-4. 参考资料：项目任务书/合同（如有）；国家/行业规范（实名、安全、隐私相关）；支付/实名/短信等外部接口协议与验签规范；内部安全/加密/日志审计规范；性能与容量基线（历史压测/运营数据）。  
+[^sre]: 《Site Reliability Engineering》，第 4 章“Service Level Objectives”；《The Site Reliability Workbook》，第 5 章“SLOs”。  
+[^ddia]: 《Designing Data-Intensive Applications》，第 5 章“Replication”、第 9 章“Consistency and Consensus”、第 11 章“Stream Processing”。  
+[^dbmq]: MySQL 8.0 Reference Manual 第 18 章“Group Replication/Partitioning”；Elasticsearch “Elasticsearch: The Definitive Guide”与官方索引/扩展章节；Redis Cluster 规范与 EVAL/Lua 原子性章节；Kafka 文档“Design/Replication/Producer Idempotence/Exactly-Once Semantics”；RabbitMQ 文档“Dead Letter Exchanges/Quorum queues/Retry & DLQ”。  
+[^currency]: ISO 4217 货币编码与“最小货币子单位”定义；Stripe/PayPal/支付宝/微信支付 API 金额字段说明。  
+[^iso]: ISO 8601:2019 日期与时间格式标准；RFC 3339 第 5.6 节互联网日期/时间戳格式。  
+[^fault]: 《Release It!》（2nd Edition）第 5 章“Stability Patterns”；Resilience4j/Hystrix 官方文档（CircuitBreaker/Retry/RateLimiter/Bulkhead）；IETF RFC 9110/7231 第 15 章 HTTP 状态码语义。  
+[^queue]: 《Site Reliability Engineering》容量与过载管理章节；《The Site Reliability Workbook》第 15 章“Handling Overload”；Nginx `limit_req`/Envoy Rate Limit 过滤器指南；令牌桶/漏桶算法经典描述。  
 
 ## 二．任务概述
 1. 目标：  
@@ -204,12 +222,3 @@ flowchart LR
 
 ## 附录
 - 参考：本需求文档为概要设计的输入，详细设计、测试计划、部署/运维手册另行编制。
-
-## 参考与注释
-- [^sre] 《Site Reliability Engineering》，第 4 章“Service Level Objectives”以及《The Site Reliability Workbook》第 5 章“SLOs”——用于 SLO/错误预算与延迟目标设定。
-- [^ddia] 《Designing Data-Intensive Applications》，第 5 章“Replication”、第 9 章“Consistency and Consensus”、第 11 章“Stream Processing”——用于一致性、账本化与流补偿设计。
-- [^dbmq] MySQL 8.0 Reference Manual 第 18 章“Group Replication/Partitioning”；Elasticsearch “Elasticsearch: The Definitive Guide”/官方索引与扩展章节；Redis Cluster 规范与 EVAL/Lua 保证原子性章节；Kafka 文档“Design/Replication/Producer Idempotence/Exactly-Once Semantics”；RabbitMQ 官方文档“Dead Letter Exchanges/Quorum queues/Retry & DLQ”。
-- [^currency] ISO 4217 货币编码与“最小货币子单位”定义；Stripe/PayPal/支付宝/微信支付 API 文档均以最小货币单位（分/cent）传金额。
-- [^iso] ISO 8601:2019 日期与时间格式标准；RFC 3339 第 5.6 节互联网日期/时间戳格式。
-- [^fault] 《Release It!》（2nd Edition）第 5 章“Stability Patterns”；Resilience4j/Hystrix 官方文档（CircuitBreaker/Retry/RateLimiter/Bulkhead）；IETF RFC 9110/7231 第 15 章 HTTP 状态码语义。
-- [^queue] 《Site Reliability Engineering》容量与过载管理章节；《The Site Reliability Workbook》第 15 章“Handling Overload”；Nginx `limit_req`/Envoy Rate Limit 过滤器官方指南；令牌桶/漏桶算法经典描述。
